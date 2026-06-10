@@ -24,6 +24,8 @@ import os
 import platform
 import plistlib
 import socket
+import struct
+import zlib
 from http.client import HTTPSConnection
 
 import fleep
@@ -197,29 +199,47 @@ class AirDropClient:
         if is_url:
             return
 
+        # Modern Apple receivers (recent iOS/macOS) only accept the "dvzip"
+        # body: a raw cpio (odc, magic 070707) archive split into chunks, each
+        # chunk independently zlib-compressed and prefixed with its 4-byte
+        # big-endian compressed length. The legacy gzip'd cpio ("x-cpio") body
+        # is rejected with an immediate connection close.
         headers = {
-            "Content-Type": "application/x-cpio",
+            "Content-Type": "application/x-dvzip",
+            "TotalBytes": str(os.path.getsize(file_path)),
         }
 
-        # Create archive in memory ...
+        # Create the cpio archive in memory ...
         stream = io.BytesIO()
         with libarchive.custom_writer(
             stream.write,
             "cpio",
-            filter_name="gzip",
             archive_write_class=AbsArchiveWrite,
         ) as archive:
             for f in [file_path]:
                 ff = os.path.basename(f)
                 archive.add_abs_file(f, os.path.join(".", ff))
-        stream.seek(0)
+        cpio = stream.getvalue()
 
-        # ... then send in chunked mode
-        success, _ = self.send_POST("/Upload", stream, headers=headers)
-
-        # TODO better: write archive chunk whenever send_POST does a read to avoid having the whole archive in memory
+        # ... then wrap it in the dvzip container and send in chunked mode
+        body = io.BytesIO(self._encode_dvzip(cpio))
+        success, _ = self.send_POST("/Upload", body, headers=headers)
 
         return success
+
+    @staticmethod
+    def _encode_dvzip(cpio, chunk_size=65536):
+        """
+        Encode a cpio archive as Apple's "dvzip" upload body: a sequence of
+        records, each a 4-byte big-endian length followed by an independent
+        zlib stream of up to ``chunk_size`` raw cpio bytes.
+        """
+        out = io.BytesIO()
+        for i in range(0, len(cpio), chunk_size):
+            comp = zlib.compress(cpio[i : i + chunk_size])
+            out.write(struct.pack(">I", len(comp)))
+            out.write(comp)
+        return out.getvalue()
 
     def _get_headers(self):
         """
