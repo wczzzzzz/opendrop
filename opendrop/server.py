@@ -16,13 +16,17 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
+
 import io
 import json
 import logging
+import os
 import platform
 import plistlib
 import socket
+import struct
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import libarchive
@@ -153,6 +157,23 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         self.send_header("Content-type", "text/html")
         self.end_headers()
 
+    def _read_request_body(self):
+        """
+        Read a request body sent with either Content-Length or chunked
+        transfer encoding (modern Apple senders always use chunked).
+        """
+        if self.headers.get("transfer-encoding", "").lower() == "chunked":
+            data = b""
+            while True:
+                length = int(self.rfile.readline().strip(), 16)
+                if length == 0:
+                    self.rfile.readline()  # trailing CRLF of last chunk
+                    return data
+                data += self.rfile.read(length)
+                self.rfile.readline()  # CRLF after each chunk
+        content_length = int(self.headers.get("Content-Length", 0))
+        return self.rfile.read(content_length)
+
     def do_GET(self):
         """
         Answer get requests
@@ -163,8 +184,7 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def handle_discover(self):
-        content_length = int(self.headers["Content-Length"])
-        post_data = self.rfile.read(content_length)
+        post_data = self._read_request_body()
 
         AirDropUtil.write_debug(
             self.config, post_data, "receive_discover_request.plist"
@@ -222,8 +242,7 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         self.wfile.write(discover_answer_binary)
 
     def handle_ask(self):
-        content_length = int(self.headers["Content-Length"])
-        post_data = self.rfile.read(content_length)
+        post_data = self._read_request_body()
 
         AirDropUtil.write_debug(self.config, post_data, "receive_ask_request.plist")
 
@@ -243,7 +262,8 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
         self.wfile.write(ask_resp_binary)
 
     def handle_upload(self):
-        if self.headers.get("content-type", "").lower() != "application/x-cpio":
+        content_type = self.headers.get("content-type", "").lower()
+        if content_type not in ("application/x-cpio", "application/x-dvzip"):
             logger.warning(
                 f"Unsupported content-type: {self.headers.get('content-type')}"
             )
@@ -298,10 +318,29 @@ class AirDropServerHandler(BaseHTTPRequestHandler):
             with libarchive.read.stream_reader(stream) as archive:
                 libarchive.extract.extract_entries(archive, flags)
 
+        def decode_dvzip(data):
+            """
+            Reassemble the raw cpio archive from Apple's dvzip body: a sequence
+            of records, each a 4-byte big-endian length followed by an
+            independent zlib stream.
+            """
+            off = 0
+            parts = []
+            while off + 4 <= len(data):
+                length = struct.unpack(">I", data[off : off + 4])[0]
+                parts.append(zlib.decompress(data[off + 4 : off + 4 + length]))
+                off += 4 + length
+            return b"".join(parts)
+
         logger.info("Receiving file(s) ...")
         start = time.time()
         reader = HTTPChunkedReader(self.rfile)
-        extract_stream(reader)
+        if content_type == "application/x-dvzip":
+            cpio = decode_dvzip(reader.readall())
+            with libarchive.memory_reader(cpio) as archive:
+                libarchive.extract.extract_entries(archive)
+        else:
+            extract_stream(reader)
 
         transferred = reader.total / 1024.0 / 1024.0
         speed = transferred / (time.time() - start)
